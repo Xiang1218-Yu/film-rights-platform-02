@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 export type ProjectStatus = 'development' | 'production' | 'post' | 'delivered';
 export type AssetType = 'master' | 'trailer' | 'poster' | 'audio' | 'subtitle';
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
@@ -8,6 +10,25 @@ export interface Contract { id: string; projectId: string; vendor: string; scope
 export interface Asset { id: string; projectId: string; name: string; type: AssetType; version: number; status: 'draft' | 'review' | 'approved' | 'locked'; owner: string; checksum: string; territories: string[]; platforms: string[]; availableFrom: string; availableTo: string; rightsTags: string[]; }
 export interface Approval { id: string; projectId: string; entityType: 'budget' | 'asset' | 'delivery'; entityId: string; title: string; requestedBy: string; status: ApprovalStatus; approver: string; createdAt: string; comment?: string; }
 export interface AuditEvent { id: string; action: string; entity: string; entityId: string; actor: string; at: string; details: string; }
+
+// 同一毫秒内的并发调用会共享 Date.now()，因此再叠加进程内自增序列与随机段，
+// 保证审批、审计等所有资源标识在进程生命周期内稳定且唯一。
+let idSequence = 0;
+export function uniqueId(prefix: string): string {
+  idSequence += 1;
+  return `${prefix}-${Date.now().toString(36)}-${idSequence.toString(36)}-${randomUUID().slice(0, 8)}`;
+}
+
+// 业务冲突（如审批已被他人处理）与幂等键冲突，HTTP 层据此映射为 409。
+export class ValidationError extends Error { code = 'VALIDATION_ERROR' as const; }
+export class ApprovalConflictError extends Error {
+  code = 'APPROVAL_CONFLICT' as const;
+  constructor(message: string, readonly current: Approval) { super(message); }
+}
+export class IdempotencyConflictError extends Error { code = 'IDEMPOTENCY_CONFLICT' as const; }
+
+export interface CreateApprovalInput extends Pick<Approval, 'projectId' | 'entityType' | 'entityId' | 'title' | 'requestedBy' | 'approver'> {}
+export interface MutationResult<T> { value: T; replayed: boolean }
 
 const now = Date.now();
 const iso = (days: number) => new Date(now + days * 86400000).toISOString().slice(0, 10);
@@ -41,6 +62,15 @@ export const approvals: Approval[] = [
 ];
 export const auditEvents: AuditEvent[] = [{ id: 'AUD-01', action: 'CREATE', entity: 'budget', entityId: 'BUD-001-V3', actor: '制片主任', at: new Date(now - 86400000).toISOString(), details: '从 V2 复制并调整后期科目' }];
 
+// Idempotency-Key → 首次请求的内容指纹与结果。网络重试或双击重放时直接返回首次结果，
+// 不产生幽灵审批记录；同一键携带不同内容则明确拒绝。
+interface IdempotentCreateRecord { fingerprint: string; approval: Approval }
+const idempotentCreates = new Map<string, IdempotentCreateRecord>();
+
+function approvalFingerprint(input: CreateApprovalInput): string {
+  return JSON.stringify([input.projectId, input.entityType, input.entityId, input.title, input.requestedBy, input.approver]);
+}
+
 export function projectSummary(projectId = projects[0].id) {
   const lines = budgetLines.filter(line => line.projectId === projectId);
   const projectContracts = contracts.filter(contract => contract.projectId === projectId);
@@ -64,9 +94,57 @@ export function rightsConflicts(projectId = projects[0].id) {
   return conflicts;
 }
 
-export function approve(id: string, status: ApprovalStatus, comment = '') {
-  const item = approvals.find(approval => approval.id === id); if (!item) return undefined;
-  item.status = status; item.comment = comment; auditEvents.unshift({ id: `AUD-${Date.now()}`, action: status.toUpperCase(), entity: item.entityType, entityId: item.entityId, actor: '当前审批人', at: new Date().toISOString(), details: comment || `${item.title} 已${status === 'approved' ? '通过' : '驳回'}` }); return item;
+export function createApproval(input: CreateApprovalInput, idempotencyKey?: string): MutationResult<Approval> {
+  for (const field of ['projectId', 'entityType', 'entityId', 'title', 'requestedBy', 'approver'] as const) {
+    if (typeof input[field] !== 'string' || input[field].trim() === '') throw new ValidationError(`字段 ${field} 不能为空`);
+  }
+  if (input.entityType !== 'budget' && input.entityType !== 'asset' && input.entityType !== 'delivery') throw new ValidationError('entityType 必须是 budget / asset / delivery');
+
+  const fingerprint = approvalFingerprint(input);
+  if (idempotencyKey) {
+    const seen = idempotentCreates.get(idempotencyKey);
+    if (seen) {
+      if (seen.fingerprint !== fingerprint) throw new IdempotencyConflictError('相同幂等键对应了不同的审批内容，已拒绝');
+      return { value: seen.approval, replayed: true };
+    }
+  }
+
+  // 业务级去重：两个角色从不同浏览器（或不同幂等键）为同一实体重复提单时，
+  // 复用已存在的待审批单，而不是制造两条互相竞争的 pending 幽灵记录。
+  const active = approvals.find(approval =>
+    approval.projectId === input.projectId
+    && approval.entityType === input.entityType
+    && approval.entityId === input.entityId
+    && approval.status === 'pending');
+  if (active) {
+    if (idempotencyKey) idempotentCreates.set(idempotencyKey, { fingerprint, approval: active });
+    return { value: active, replayed: true };
+  }
+
+  const item: Approval = { ...input, id: uniqueId('APR'), status: 'pending', createdAt: new Date().toISOString() };
+  approvals.unshift(item);
+  auditEvents.unshift({ id: uniqueId('AUD'), action: 'CREATE', entity: item.entityType, entityId: item.entityId, actor: item.requestedBy, at: item.createdAt, details: `提交审批：${item.title}` });
+  if (idempotencyKey) idempotentCreates.set(idempotencyKey, { fingerprint, approval: item });
+  return { value: item, replayed: false };
 }
-export function createApproval(input: Pick<Approval, 'projectId' | 'entityType' | 'entityId' | 'title' | 'requestedBy' | 'approver'>) { const item: Approval = { ...input, id: `APR-${Date.now()}`, status: 'pending', createdAt: new Date().toISOString() }; approvals.unshift(item); return item; }
+
+export function approve(id: string, status: Exclude<ApprovalStatus, 'pending'>, comment = '', actor = '当前审批人'): MutationResult<Approval> | undefined {
+  const item = approvals.find(approval => approval.id === id);
+  if (!item) return undefined;
+  if (status !== 'approved' && status !== 'rejected') throw new ValidationError('status 必须是 approved 或 rejected');
+
+  // 状态机：pending 是唯一可迁移状态。
+  // - 相同动作重试（网络重发/双击）：幂等返回首次结果，不再写审计；
+  // - 冲突动作（他人已通过又来驳回，反之亦然）：明确 409，绝不允许后一次静默覆盖前一次。
+  if (item.status !== 'pending') {
+    if (item.status === status) return { value: item, replayed: true };
+    throw new ApprovalConflictError(`该审批已由 ${item.approver} ${item.status === 'approved' ? '通过' : '驳回'}，不能再执行${status === 'approved' ? '通过' : '驳回'}`, item);
+  }
+
+  item.status = status;
+  item.comment = comment;
+  auditEvents.unshift({ id: uniqueId('AUD'), action: status.toUpperCase(), entity: item.entityType, entityId: item.entityId, actor, at: new Date().toISOString(), details: comment || `${item.title} 已${status === 'approved' ? '通过' : '驳回'}` });
+  return { value: item, replayed: false };
+}
+
 export function dashboard() { return projects.map(project => projectSummary(project.id)).map(summary => ({ id: summary.project?.id, title: summary.project?.title, status: summary.project?.status, forecast: summary.forecast, variance: summary.variance, pendingApprovals: summary.pendingApprovals, rightsConflicts: rightsConflicts(summary.project?.id).length })); }
