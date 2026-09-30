@@ -1,3 +1,5 @@
+import { randomBytes } from 'node:crypto';
+
 export type ProjectStatus = 'development' | 'production' | 'post' | 'delivered';
 export type AssetType = 'master' | 'trailer' | 'poster' | 'audio' | 'subtitle';
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
@@ -6,8 +8,50 @@ export interface Project { id: string; code: string; title: string; season: numb
 export interface BudgetLine { id: string; projectId: string; category: string; subcategory: string; planned: number; committed: number; actual: number; forecast: number; owner: string; risk: 'low' | 'medium' | 'high'; }
 export interface Contract { id: string; projectId: string; vendor: string; scope: string; ceiling: number; committed: number; paid: number; milestones: { name: string; due: string; amount: number; status: 'open' | 'invoiced' | 'paid' }[]; }
 export interface Asset { id: string; projectId: string; name: string; type: AssetType; version: number; status: 'draft' | 'review' | 'approved' | 'locked'; owner: string; checksum: string; territories: string[]; platforms: string[]; availableFrom: string; availableTo: string; rightsTags: string[]; }
-export interface Approval { id: string; projectId: string; entityType: 'budget' | 'asset' | 'delivery'; entityId: string; title: string; requestedBy: string; status: ApprovalStatus; approver: string; createdAt: string; comment?: string; }
-export interface AuditEvent { id: string; action: string; entity: string; entityId: string; actor: string; at: string; details: string; }
+export interface Approval { id: string; projectId: string; entityType: 'budget' | 'asset' | 'delivery'; entityId: string; title: string; requestedBy: string; status: ApprovalStatus; approver: string; createdAt: string; decidedAt?: string; comment?: string; idempotencyKey?: string; }
+export interface AuditEvent { id: string; action: string; entity: string; entityId: string; actor: string; at: string; details: string; approvalId?: string; idempotencyKey?: string; }
+
+/** 业务冲突：审批已被另一个请求处理，不能被本次状态覆盖 */
+export class ApprovalConflictError extends Error {
+  constructor(public current: Approval, public requested: ApprovalStatus) {
+    super(`审批 ${current.id} 已${current.status === 'approved' ? '通过' : '驳回'}，无法再次${requested === 'approved' ? '通过' : '驳回'}`);
+    this.name = 'ApprovalConflictError';
+  }
+}
+
+/**
+ * 稳定且唯一的资源标识：进程内单调序列 + 密码学随机后缀。
+ * Date.now() 在并发请求下同毫秒会碰撞（已由并发复现验证），不能单独作为 id。
+ */
+let idSequence = 0;
+function nextId(prefix: string) {
+  idSequence += 1;
+  return `${prefix}-${Date.now().toString(36)}-${idSequence.toString(36)}-${randomBytes(4).toString('hex')}`;
+}
+
+/** 幂等记录：同一个 Idempotency-Key 的网络重试必须落到同一结果，绝不产生幽灵记录 */
+interface IdempotentRecord<T = unknown> { namespace: string; result: T; createdAt: string; }
+const idempotencyStore = new Map<string, IdempotentRecord>();
+// 同键并发请求的在途占位：第二个请求到达时第一个可能尚未写库，必须等待其结果而不是各自执行
+const idempotencyInFlight = new Map<string, Promise<unknown>>();
+
+async function idempotent<T extends { statusCode: number }>(namespace: string, key: string | undefined, produce: () => T | Promise<T>): Promise<T & { replayed: boolean }> {
+  if (!key) return { ...(await produce()), replayed: false };
+  const storeKey = `${namespace}:${key}`;
+  const existing = idempotencyStore.get(storeKey) as IdempotentRecord<T> | undefined;
+  if (existing) return { ...existing.result, replayed: true };
+  const inFlight = idempotencyInFlight.get(storeKey) as Promise<T> | undefined;
+  if (inFlight) return { ...(await inFlight), replayed: true };
+  const promise = Promise.resolve().then(produce);
+  idempotencyInFlight.set(storeKey, promise);
+  try {
+    const result = await promise;
+    idempotencyStore.set(storeKey, { namespace, result, createdAt: new Date().toISOString() });
+    return { ...result, replayed: false };
+  } finally {
+    idempotencyInFlight.delete(storeKey);
+  }
+}
 
 const now = Date.now();
 const iso = (days: number) => new Date(now + days * 86400000).toISOString().slice(0, 10);
@@ -64,9 +108,80 @@ export function rightsConflicts(projectId = projects[0].id) {
   return conflicts;
 }
 
-export function approve(id: string, status: ApprovalStatus, comment = '') {
-  const item = approvals.find(approval => approval.id === id); if (!item) return undefined;
-  item.status = status; item.comment = comment; auditEvents.unshift({ id: `AUD-${Date.now()}`, action: status.toUpperCase(), entity: item.entityType, entityId: item.entityId, actor: '当前审批人', at: new Date().toISOString(), details: comment || `${item.title} 已${status === 'approved' ? '通过' : '驳回'}` }); return item;
+export interface CreateApprovalInput {
+  projectId: string; entityType: Approval['entityType']; entityId: string;
+  title: string; requestedBy: string; approver: string;
 }
-export function createApproval(input: Pick<Approval, 'projectId' | 'entityType' | 'entityId' | 'title' | 'requestedBy' | 'approver'>) { const item: Approval = { ...input, id: `APR-${Date.now()}`, status: 'pending', createdAt: new Date().toISOString() }; approvals.unshift(item); return item; }
+export interface ApprovalMutationResult { approval: Approval; auditEvent?: AuditEvent; replayed: boolean; statusCode: number; deduplicated?: boolean; }
+
+function recordAudit(event: Omit<AuditEvent, 'id'>): AuditEvent {
+  const item: AuditEvent = { ...event, id: nextId('AUD') };
+  auditEvents.unshift(item);
+  return item;
+}
+
+/**
+ * 创建审批。
+ * 1) 带 Idempotency-Key 的网络重试：同一 key 永远返回第一次的审批（HTTP 201 原样回放）；
+ * 2) 无 key 的重复提交：同一资源已有 pending 审批时幂等返回该审批（200），不制造幽灵记录；
+ * 3) 正常创建：每个审批拿到进程内唯一的 id，并写一条 SUBMIT 审计事件。
+ */
+export async function createApproval(input: CreateApprovalInput, idempotencyKey?: string): Promise<ApprovalMutationResult> {
+  return idempotent<ApprovalMutationResult>('approval.create', idempotencyKey, async () => {
+    // 业务去重只兜底“没有幂等键”的双击；带键的并发请求必须严格由键存储裁决，
+    // 否则两个同键请求可能都绕过键存储、落到同一条 pending 上（竞态下丢失回放语义）。
+    if (!idempotencyKey) {
+      const pendingDuplicate = approvals.find(
+        item => item.status === 'pending'
+          && item.projectId === input.projectId
+          && item.entityType === input.entityType
+          && item.entityId === input.entityId,
+      );
+      if (pendingDuplicate) {
+        return { approval: pendingDuplicate, replayed: false, statusCode: 200, deduplicated: true };
+      }
+    }
+    const approval: Approval = { ...input, id: nextId('APR'), status: 'pending', createdAt: new Date().toISOString(), idempotencyKey };
+    approvals.unshift(approval);
+    const auditEvent = recordAudit({
+      action: 'SUBMIT', entity: approval.entityType, entityId: approval.entityId, actor: approval.requestedBy,
+      at: approval.createdAt, details: `提交审批：${approval.title}`, approvalId: approval.id, idempotencyKey,
+    });
+    return { approval, auditEvent, replayed: false, statusCode: 201 };
+  });
+}
+
+/**
+ * 处理审批。
+ * - pending → approved/rejected：一次性状态转移，写审计事件；
+ * - 已决策且动作相同：幂等回放当前状态（200, Idempotent-Replay: true），不再写审计；
+ * - 已决策但动作冲突（一个通过、一个驳回同时到达）：抛 ApprovalConflictError（HTTP 409），
+ *   后一次绝不覆盖前一次状态；
+ * - 带 Idempotency-Key 的纯网络重试：无论命中哪条分支，都原样回放第一次响应。
+ */
+export async function decideApproval(id: string, status: ApprovalStatus, comment = '', actor = '当前审批人', idempotencyKey?: string): Promise<ApprovalMutationResult> {
+  return idempotent<ApprovalMutationResult>(`approval.decide:${id}`, idempotencyKey, async () => {
+    const item = approvals.find(approval => approval.id === id);
+    if (!item) return { approval: undefined as unknown as Approval, replayed: false, statusCode: 404 };
+    if (item.status !== 'pending') {
+      if (item.status === status) return { approval: item, replayed: false, statusCode: 200 };
+      throw new ApprovalConflictError(item, status);
+    }
+    item.status = status;
+    item.comment = comment;
+    item.decidedAt = new Date().toISOString();
+    const auditEvent = recordAudit({
+      action: status.toUpperCase(), entity: item.entityType, entityId: item.entityId, actor,
+      at: item.decidedAt, details: comment || `${item.title} 已${status === 'approved' ? '通过' : '驳回'}`,
+      approvalId: item.id, idempotencyKey,
+    });
+    return { approval: item, auditEvent, replayed: false, statusCode: 200 };
+  });
+}
+
+/** 兼容旧调用方的便捷封装 */
+export async function approve(id: string, status: ApprovalStatus, comment = ''): Promise<Approval | undefined> {
+  try { return (await decideApproval(id, status, comment)).approval; }
+  catch { return undefined; }
+}
 export function dashboard() { return projects.map(project => projectSummary(project.id)).map(summary => ({ id: summary.project?.id, title: summary.project?.title, status: summary.project?.status, forecast: summary.forecast, variance: summary.variance, pendingApprovals: summary.pendingApprovals, rightsConflicts: rightsConflicts(summary.project?.id).length })); }
